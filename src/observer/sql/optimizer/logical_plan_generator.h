@@ -17,6 +17,8 @@ See the Mulan PSL v2 for more details. */
 #include "common/lang/memory.h"
 #include "common/sys/rc.h"
 #include "common/type/attr_type.h"
+#include "sql/stmt/update_stmt.h"
+#include <memory>
 
 class Stmt;
 class CalcStmt;
@@ -42,6 +44,7 @@ private:
   RC create_plan(InsertStmt *insert_stmt, unique_ptr<LogicalOperator> &logical_operator);
   RC create_plan(DeleteStmt *delete_stmt, unique_ptr<LogicalOperator> &logical_operator);
   RC create_plan(ExplainStmt *explain_stmt, unique_ptr<LogicalOperator> &logical_operator);
+  RC create_plan(UpdateStmt *update_stmt, unique_ptr<LogicalOperator> &logical_operator);
 
   RC create_group_by_plan(SelectStmt *select_stmt, unique_ptr<LogicalOperator> &logical_operator);
 

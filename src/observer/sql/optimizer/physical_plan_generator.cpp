@@ -42,6 +42,8 @@ See the Mulan PSL v2 for more details. */
 #include "sql/operator/hash_group_by_physical_operator.h"
 #include "sql/operator/scalar_group_by_physical_operator.h"
 #include "sql/operator/table_scan_vec_physical_operator.h"
+#include "sql/operator/update_logical_operator.h"
+#include "sql/operator/update_physical_operator.h"
 #include "sql/optimizer/physical_plan_generator.h"
 
 using namespace std;
@@ -69,6 +71,10 @@ RC PhysicalPlanGenerator::create(LogicalOperator &logical_operator, unique_ptr<P
 
     case LogicalOperatorType::INSERT: {
       return create_plan(static_cast<InsertLogicalOperator &>(logical_operator), oper, session);
+    } break;
+
+    case LogicalOperatorType::UPDATE: {
+      return create_plan(static_cast<UpdateLogicalOperator &>(logical_operator), oper, session);
     } break;
 
     case LogicalOperatorType::DELETE: {
@@ -251,6 +257,36 @@ RC PhysicalPlanGenerator::create_plan(InsertLogicalOperator &insert_oper, unique
   return RC::SUCCESS;
 }
 
+RC PhysicalPlanGenerator::create_plan(UpdateLogicalOperator &update_oper, unique_ptr<PhysicalOperator> &oper, Session* session)
+{
+  vector<unique_ptr<LogicalOperator>> &child_opers = update_oper.children();
+
+  unique_ptr<PhysicalOperator> child_physical_oper;
+
+  RC rc = RC::SUCCESS;
+  if (!child_opers.empty()) {
+    LogicalOperator *child_oper = child_opers.front().get();
+
+    rc = create(*child_oper, child_physical_oper, session);
+    if (rc != RC::SUCCESS) {
+      LOG_WARN("failed to create child physical operator for update. rc=%s", strrc(rc));
+      return rc;
+    }
+  }
+
+  Table                 *table = update_oper.table();
+  const FieldMeta       &field = update_oper.target_field();
+  vector<Value>          values = std::move(update_oper.values());
+  UpdatePhysicalOperator *update_phy_oper = new UpdatePhysicalOperator(table, field, std::move(values));
+  oper.reset(update_phy_oper);
+
+  if (child_physical_oper) {
+    oper->add_child(std::move(child_physical_oper));
+  }
+
+  return RC::SUCCESS;
+}
+
 RC PhysicalPlanGenerator::create_plan(DeleteLogicalOperator &delete_oper, unique_ptr<PhysicalOperator> &oper, Session* session)
 {
   vector<unique_ptr<LogicalOperator>> &child_opers = delete_oper.children();
@@ -308,7 +344,19 @@ RC PhysicalPlanGenerator::create_plan(JoinLogicalOperator &join_oper, unique_ptr
     return RC::INTERNAL;
   }
   if (session->hash_join_on() && can_use_hash_join(join_oper)) {
-    // your code here
+    unique_ptr<HashJoinPhysicalOperator> hash_join_oper = make_unique<HashJoinPhysicalOperator>();
+
+    for (auto &child_oper : child_opers) {
+      unique_ptr<PhysicalOperator> child_physical_oper;
+      rc = create(*child_oper, child_physical_oper, session);
+      if (rc != RC::SUCCESS) {
+        LOG_WARN("failed to create physical child oper for hash join. rc=%s", strrc(rc));
+        return rc;
+      }
+      hash_join_oper->add_child(std::move(child_physical_oper));
+    }
+
+    oper = std::move(hash_join_oper);
   } else {
     unique_ptr<PhysicalOperator> join_physical_oper(new NestedLoopJoinPhysicalOperator());
     for (auto &child_oper : child_opers) {
@@ -329,8 +377,43 @@ RC PhysicalPlanGenerator::create_plan(JoinLogicalOperator &join_oper, unique_ptr
 
 bool PhysicalPlanGenerator::can_use_hash_join(JoinLogicalOperator &join_oper)
 {
-  // your code here
-  return false;
+  Expression *predicate = join_oper.predicates();
+  if (predicate == nullptr) {
+    return false;
+  }
+
+  auto check_expr = [](Expression *expr, auto &&self) -> bool {
+    if (expr == nullptr) {
+      return false;
+    }
+
+    if (expr->type() == ExprType::COMPARISON) {
+      auto *cmp_expr = static_cast<ComparisonExpr *>(expr);
+      if (cmp_expr->comp() != CompOp::EQUAL_TO) {
+        return false;
+      }
+      auto &left  = cmp_expr->left();
+      auto &right = cmp_expr->right();
+      return left->type() == ExprType::FIELD && right->type() == ExprType::FIELD;
+    }
+
+    if (expr->type() == ExprType::CONJUNCTION) {
+      auto *conjunction_expr = static_cast<ConjunctionExpr *>(expr);
+      if (conjunction_expr->conjunction_type() != ConjunctionExpr::Type::AND) {
+        return false;
+      }
+      for (auto &child : conjunction_expr->children()) {
+        if (!self(child.get(), self)) {
+          return false;
+        }
+      }
+      return !conjunction_expr->children().empty();
+    }
+
+    return false;
+  };
+
+  return check_expr(predicate, check_expr);
 }
 
 RC PhysicalPlanGenerator::create_plan(CalcLogicalOperator &logical_oper, unique_ptr<PhysicalOperator> &oper, Session* session)

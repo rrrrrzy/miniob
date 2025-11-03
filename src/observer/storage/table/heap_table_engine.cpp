@@ -15,6 +15,8 @@ See the Mulan PSL v2 for more details. */
 #include "storage/common/meta_util.h"
 #include "storage/db/db.h"
 
+#include <cstring>
+
 
 HeapTableEngine::~HeapTableEngine()
 {
@@ -101,6 +103,95 @@ RC HeapTableEngine::delete_record(const Record &record)
   }
   rc = record_handler_->delete_record(&record.rid());
   return rc;
+}
+
+RC HeapTableEngine::update_record_with_trx(const Record &old_record, const Record &new_record, Trx *trx)
+{
+  if (new_record.data() == nullptr) {
+    LOG_WARN("new record data is null. table=%s", table_meta_->name());
+    return RC::INVALID_ARGUMENT;
+  }
+
+  const int record_len = table_meta_->record_size();
+
+  if (new_record.len() != record_len) {
+    LOG_WARN("unexpected new record length %d while updating table=%s", new_record.len(), table_meta_->name());
+    return RC::INVALID_ARGUMENT;
+  }
+
+  if (old_record.len() != record_len) {
+    LOG_WARN("unexpected old record length %d while updating table=%s", old_record.len(), table_meta_->name());
+    return RC::INVALID_ARGUMENT;
+  }
+
+  (void)trx;
+
+  Record old_record_copy;
+  RC rc = old_record_copy.copy_data(old_record.data(), old_record.len());
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to copy old record when updating table=%s, rc=%s", table_meta_->name(), strrc(rc));
+    return rc;
+  }
+  old_record_copy.set_rid(old_record.rid());
+  old_record_copy.set_key(old_record.key());
+
+  const RID &rid = old_record_copy.rid();
+
+  rc = delete_entry_of_indexes(old_record_copy.data(), rid, true /*error_on_not_exists*/);
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to remove old index entries when updating record. table=%s, rc=%s",
+        table_meta_->name(), strrc(rc));
+    return rc;
+  }
+
+  auto restore_indexes = [&](const Record &record) {
+    RC restore_rc = insert_entry_of_indexes(record.data(), record.rid());
+    if (restore_rc != RC::SUCCESS) {
+      LOG_PANIC("failed to restore index entries after update failure. table=%s, rc=%s",
+          table_meta_->name(), strrc(restore_rc));
+    }
+  };
+
+  auto write_record = [&](const Record &src) -> RC {
+    bool length_mismatch = false;
+    RC visit_rc = record_handler_->visit_record(rid, [&](Record &record) -> bool {
+      if (record.len() != record_len) {
+        LOG_WARN("unexpected record length %d while updating table=%s", record.len(), table_meta_->name());
+        length_mismatch = true;
+        return false;
+      }
+      std::memcpy(record.data(), src.data(), record_len);
+      return true;
+    });
+
+    if (visit_rc == RC::SUCCESS && length_mismatch) {
+      return RC::INTERNAL;
+    }
+    return visit_rc;
+  };
+
+  rc = write_record(new_record);
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to write new record content. table=%s, rc=%s", table_meta_->name(), strrc(rc));
+    restore_indexes(old_record_copy);
+    return rc;
+  }
+
+  rc = insert_entry_of_indexes(new_record.data(), rid);
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to insert new index entries when updating record. table=%s, rc=%s",
+        table_meta_->name(), strrc(rc));
+
+    RC revert_rc = write_record(old_record_copy);
+    if (revert_rc != RC::SUCCESS) {
+      LOG_PANIC("failed to revert record content after index insertion failure. table=%s, rc=%s",
+          table_meta_->name(), strrc(revert_rc));
+    }
+    restore_indexes(old_record_copy);
+    return rc;
+  }
+
+  return RC::SUCCESS;
 }
 
 RC HeapTableEngine::get_record_scanner(RecordScanner *&scanner, Trx *trx, ReadWriteMode mode)

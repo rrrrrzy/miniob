@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "sql/operator/insert_logical_operator.h"
 #include "sql/operator/join_logical_operator.h"
 #include "sql/operator/logical_operator.h"
+#include "sql/operator/update_logical_operator.h"
 #include "sql/operator/predicate_logical_operator.h"
 #include "sql/operator/project_logical_operator.h"
 #include "sql/operator/table_get_logical_operator.h"
@@ -36,6 +37,7 @@ See the Mulan PSL v2 for more details. */
 #include "sql/stmt/stmt.h"
 
 #include "sql/expr/expression_iterator.h"
+#include "sql/stmt/update_stmt.h"
 
 using namespace std;
 using namespace common;
@@ -62,6 +64,12 @@ RC LogicalPlanGenerator::create(Stmt *stmt, unique_ptr<LogicalOperator> &logical
       rc = create_plan(insert_stmt, logical_operator);
     } break;
 
+    case StmtType::UPDATE: {
+      UpdateStmt *update_stmt = static_cast<UpdateStmt *>(stmt);
+
+      rc = create_plan(update_stmt, logical_operator);
+    } break;
+
     case StmtType::DELETE: {
       DeleteStmt *delete_stmt = static_cast<DeleteStmt *>(stmt);
 
@@ -83,6 +91,50 @@ RC LogicalPlanGenerator::create(Stmt *stmt, unique_ptr<LogicalOperator> &logical
 RC LogicalPlanGenerator::create_plan(CalcStmt *calc_stmt, unique_ptr<LogicalOperator> &logical_operator)
 {
   logical_operator.reset(new CalcLogicalOperator(std::move(calc_stmt->expressions())));
+  return RC::SUCCESS;
+}
+
+RC LogicalPlanGenerator::create_plan(UpdateStmt *update_stmt, unique_ptr<LogicalOperator> &logical_operator)
+{
+  Table *table = update_stmt->table();
+  ASSERT(table != nullptr, "table should not be null in update stmt");
+
+  unique_ptr<LogicalOperator> table_get_oper(new TableGetLogicalOperator(table, ReadWriteMode::READ_WRITE));
+
+  unique_ptr<LogicalOperator> predicate_oper;
+  vector<unique_ptr<Expression>> table_predicates;
+  FilterStmt *filter_stmt = update_stmt->filter_stmt();
+  if (filter_stmt != nullptr) {
+    RC rc = create_plan(filter_stmt, predicate_oper);
+    if (OB_FAIL(rc)) {
+      LOG_WARN("failed to create predicate logical plan for update. rc=%s", strrc(rc));
+      return rc;
+    }
+
+    if (predicate_oper) {
+      vector<unique_ptr<Expression>> &predicate_exprs = predicate_oper->expressions();
+      table_predicates.reserve(predicate_exprs.size());
+      for (const auto &expr : predicate_exprs) {
+        table_predicates.emplace_back(expr->copy());
+      }
+    }
+  }
+  vector<Value> values = update_stmt->values();
+  const FieldMeta &target_field = update_stmt->target_field();
+  unique_ptr<LogicalOperator> update_oper(new UpdateLogicalOperator(table, target_field, std::move(values)));
+
+  if (!table_predicates.empty()) {
+    static_cast<TableGetLogicalOperator *>(table_get_oper.get())->set_predicates(std::move(table_predicates));
+  }
+
+  if (predicate_oper) {
+    predicate_oper->add_child(std::move(table_get_oper));
+    update_oper->add_child(std::move(predicate_oper));
+  } else {
+    update_oper->add_child(std::move(table_get_oper));
+  }
+
+  logical_operator = std::move(update_oper);
   return RC::SUCCESS;
 }
 

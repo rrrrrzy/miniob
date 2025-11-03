@@ -8,21 +8,12 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
-#pragma once
+//
+// Created by WangYunlai on 2023/4/25.
+//
 
-#include "sql/operator/nested_loop_join_physical_operator.h"
+#include "sql/operator/update_logical_operator.h"
 
-/**
- * @brief Hash Join 算子
- * @ingroup PhysicalOperator
- */
-class HashJoinPhysicalOperator : public NestedLoopJoinPhysicalOperator
-{
-public:
-    HashJoinPhysicalOperator()          = default;
-    ~HashJoinPhysicalOperator() override = default;
-
-    PhysicalOperatorType type() const override { return PhysicalOperatorType::HASH_JOIN; }
-
-    OpType get_op_type() const override { return OpType::INNERHASHJOIN; }
-};
+UpdateLogicalOperator::UpdateLogicalOperator(Table *table, FieldMeta field, vector<Value> values)
+    : table_(table), values_(std::move(values)), target_field_(field)
+{}
